@@ -1060,7 +1060,7 @@ func TestConstructRequestRetentionTime(t *testing.T) {
 					},
 				}
 
-				req, _ := om.constructRequestFor(nil)
+				req, _, _ := om.constructRequestFor(nil)
 
 				expectedRetention := expectedRetention(version, retention)
 				if req.RetentionTime != expectedRetention {
@@ -1624,4 +1624,101 @@ func goroutinesIn(functions ...string) int {
 		}
 	}
 	return n
+}
+
+func TestOffsetManagerCommitFollowsOwnership(t *testing.T) {
+	config := NewTestConfig()
+	config.Consumer.Offsets.AutoCommit.Enable = false
+	capture := &offsetCommitCapture{inner: NewMockOffsetCommitResponse(t)}
+	om, _, _ := initHandledOffsetManager(t, config, capture)
+
+	owned := map[string][]int32{"my_topic": {0, 1}}
+	om.ownership = func(topic string, partition int32) bool {
+		return slices.Contains(owned[topic], partition)
+	}
+
+	pom0, err := om.ManagePartition("my_topic", 0)
+	require.NoError(t, err)
+	pom1, err := om.ManagePartition("my_topic", 1)
+	require.NoError(t, err)
+	pom0.MarkOffset(100, "")
+	pom1.MarkOffset(200, "")
+
+	// partition 1 is revoked after its offset was marked but before the
+	// commit is built
+	owned["my_topic"] = []int32{0}
+
+	err = om.Commit()
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrOffsetCommitRevoked)
+	require.True(t, IsCommitRevocation(err), "a dropped commit must classify as revocation")
+	var cerr *OffsetCommitError
+	require.ErrorAs(t, err, &cerr)
+	require.Equal(t, "my_topic", cerr.Topic)
+	require.Equal(t, int32(1), cerr.Partition)
+	require.Equal(t, int64(200), cerr.Offset)
+	require.Equal(t, int32(1), cerr.Generation)
+
+	// only the still-owned partition was sent, carrying the member identity
+	reqs := capture.requests()
+	require.Len(t, reqs, 1)
+	require.Equal(t, "member", reqs[0].ConsumerID)
+	require.Equal(t, int32(1), reqs[0].ConsumerGroupGeneration)
+	offset, _, err := reqs[0].Offset("my_topic", 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(100), offset)
+	_, _, err = reqs[0].Offset("my_topic", 1)
+	require.Error(t, err, "the revoked partition must not be committed")
+}
+
+func TestOffsetManagerCommitRejectedRecordsPartitionAndGeneration(t *testing.T) {
+	t.Run("revocation is recorded and not redispatched", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Consumer.Offsets.AutoCommit.Enable = false
+		capture := &offsetCommitCapture{inner: NewMockOffsetCommitResponse(t).SetError("group", "my_topic", 0, ErrIllegalGeneration)}
+		om, _, _ := initHandledOffsetManager(t, config, capture)
+
+		pom, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+		pom.MarkOffset(100, "")
+
+		err = om.Commit()
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrIllegalGeneration)
+		require.True(t, IsCommitRevocation(err))
+		var cerr *OffsetCommitError
+		require.ErrorAs(t, err, &cerr)
+		require.Equal(t, "my_topic", cerr.Topic)
+		require.Equal(t, int32(0), cerr.Partition)
+		require.Equal(t, int64(100), cerr.Offset)
+		require.Equal(t, int32(1), cerr.Generation)
+	})
+
+	t.Run("coordinator failure is not a revocation", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Consumer.Offsets.AutoCommit.Enable = false
+		capture := &offsetCommitCapture{inner: NewMockOffsetCommitResponse(t).SetError("group", "my_topic", 0, ErrNotCoordinatorForConsumer)}
+		om, _, _ := initHandledOffsetManager(t, config, capture)
+
+		pom, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+		pom.MarkOffset(100, "")
+
+		err = om.Commit()
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrNotCoordinatorForConsumer)
+		require.False(t, IsCommitRevocation(err), "a coordinator failure is retriable")
+	})
+}
+
+func TestIsCommitRevocation(t *testing.T) {
+	require.False(t, IsCommitRevocation(nil))
+	require.False(t, IsCommitRevocation(errors.New("connection reset")))
+	require.True(t, IsCommitRevocation(ErrOffsetCommitRevoked))
+	require.True(t, IsCommitRevocation(&OffsetCommitError{Err: ErrOffsetCommitRevoked}))
+	require.True(t, IsCommitRevocation(&OffsetCommitError{Err: ErrIllegalGeneration}))
+	require.True(t, IsCommitRevocation(&OffsetCommitError{Err: ErrUnknownMemberId}))
+	require.True(t, IsCommitRevocation(&OffsetCommitError{Err: ErrFencedInstancedId}))
+	require.False(t, IsCommitRevocation(&OffsetCommitError{Err: ErrNotCoordinatorForConsumer}))
+	require.False(t, IsCommitRevocation(&OffsetCommitError{Err: ErrOffsetMetadataTooLarge}))
 }

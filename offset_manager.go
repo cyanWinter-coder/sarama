@@ -2,6 +2,7 @@ package sarama
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -22,8 +23,13 @@ type OffsetManager interface {
 	Close() error
 
 	// Commit commits the offsets. This method can be used if AutoCommit.Enable is
-	// set to false.
-	Commit()
+	// set to false. It returns nil once every marked offset has been accepted by
+	// the coordinator. When a commit is rejected, the returned error wraps an
+	// *OffsetCommitError per failed partition, recording the partition and the
+	// group generation; use IsCommitRevocation to tell a revocation (the
+	// partition is no longer owned, retrying is pointless) from a network or
+	// coordinator failure that a retry may succeed on.
+	Commit() error
 }
 
 type offsetManager struct {
@@ -39,6 +45,12 @@ type offsetManager struct {
 	// generationLock prevents a commit from crossing a generation boundary
 	generationLock sync.RWMutex
 	generation     int32
+
+	// ownership, when set, gates commits to partitions this member still owns:
+	// a commit for a partition revoked by a rebalance is dropped and recorded
+	// instead of overwriting the new owner's offsets. nil means every managed
+	// partition may be committed (standalone use outside a consumer group).
+	ownership func(topic string, partition int32) bool
 
 	brokerLock sync.RWMutex
 	broker     *Broker
@@ -125,7 +137,7 @@ func (om *offsetManager) Close() error {
 		// flush one last time
 		if om.conf.Consumer.Offsets.AutoCommit.Enable {
 			for attempt := 0; attempt <= om.conf.Consumer.Offsets.Retry.Max; attempt++ {
-				om.flushToBroker()
+				_ = om.flushToBroker()
 				if om.releasePOMs(false) == 0 {
 					break
 				}
@@ -264,16 +276,19 @@ func (om *offsetManager) mainLoop() {
 	for {
 		select {
 		case <-om.ticker.C:
-			om.Commit()
+			if err := om.Commit(); err != nil {
+				Logger.Printf("consumer-group/offset-manager: auto-commit failed: %v\n", err)
+			}
 		case <-om.closing:
 			return
 		}
 	}
 }
 
-func (om *offsetManager) Commit() {
-	om.flushToBroker()
+func (om *offsetManager) Commit() error {
+	err := om.flushToBroker()
 	om.releasePOMs(false)
+	return err
 }
 
 // transitionGeneration keeps commits out while the coordinator establishes
@@ -302,48 +317,45 @@ func (ps partitionTargets) covers(topic string, partition int32) bool {
 	return ok
 }
 
-func (om *offsetManager) flushToBroker() {
-	om.flushToBrokerFor(nil)
+func (om *offsetManager) flushToBroker() error {
+	return om.flushToBrokerFor(nil)
 }
 
-func (om *offsetManager) flushToBrokerFor(targets partitionTargets) {
+func (om *offsetManager) flushToBrokerFor(targets partitionTargets) error {
 	om.generationLock.RLock()
 	defer om.generationLock.RUnlock()
 
 	broker, err := om.coordinator()
 	if err != nil {
-		om.handleErrorFor(err, targets)
-		return
+		return om.commitFailureFor(err, targets)
 	}
 
 	// Care needs to be taken to unlock this. Don't want to defer the unlock as this would
 	// cause the lock to be held while waiting for the broker to reply.
 	broker.lock.Lock()
-	req, versions := om.constructRequestFor(targets)
+	req, versions, dropped := om.constructRequestFor(targets)
 	if req == nil {
 		broker.lock.Unlock()
-		return
+		return dropped
 	}
 	resp, rp, err := sendOffsetCommit(broker, req)
 	broker.lock.Unlock()
 
 	if err != nil {
-		om.handleErrorFor(err, targets)
 		om.releaseCoordinator(broker)
 		_ = broker.Close()
-		return
+		return errors.Join(dropped, om.commitFailure(req, err))
 	}
 
 	err = handleResponsePromise(req, resp, rp, nil)
 	if err != nil {
-		om.handleErrorFor(err, targets)
 		om.releaseCoordinator(broker)
 		_ = broker.Close()
-		return
+		return errors.Join(dropped, om.commitFailure(req, err))
 	}
 
 	broker.handleThrottledResponse(resp)
-	om.handleResponse(broker, req, resp, versions)
+	return errors.Join(dropped, om.handleResponse(broker, req, resp, versions))
 }
 
 func sendOffsetCommit(coordinator *Broker, req *OffsetCommitRequest) (*OffsetCommitResponse, *responsePromise, error) {
@@ -357,8 +369,10 @@ func sendOffsetCommit(coordinator *Broker, req *OffsetCommitRequest) (*OffsetCom
 	return resp, promise, nil
 }
 
-// constructRequestFor also returns the version of each POM it took an offset from
-func (om *offsetManager) constructRequestFor(targets partitionTargets) (*OffsetCommitRequest, map[*partitionOffsetManager]uint64) {
+// constructRequestFor also returns the version of each POM it took an offset
+// from, plus an error recording every dirty offset it dropped because the
+// partition is no longer owned by this member
+func (om *offsetManager) constructRequestFor(targets partitionTargets) (*OffsetCommitRequest, map[*partitionOffsetManager]uint64, error) {
 	r := NewOffsetCommitRequest(om.conf, om.group)
 	r.ConsumerID = om.memberID
 	// om.generation is read under generationLock, held by flushToBrokerFor
@@ -377,35 +391,55 @@ func (om *offsetManager) constructRequestFor(targets partitionTargets) (*OffsetC
 	defer om.pomsLock.RUnlock()
 
 	versions := make(map[*partitionOffsetManager]uint64)
+	var dropped []error
 	for topic, topicManagers := range om.poms {
 		for partition, pom := range topicManagers {
 			if !targets.covers(topic, partition) {
 				continue
 			}
 			pom.lock.Lock()
-			if pom.dirty {
-				r.AddBlockWithLeaderEpoch(pom.topic, pom.partition, pom.offset, pom.leaderEpoch, commitTimestamp, pom.metadata)
-				versions[pom] = pom.version
+			if !pom.dirty {
+				pom.lock.Unlock()
+				continue
 			}
+			if om.ownership != nil && !om.ownership(topic, partition) {
+				// the partition was revoked after the offset was marked;
+				// committing it would overwrite the new owner's offsets
+				cerr := &OffsetCommitError{
+					Topic:      topic,
+					Partition:  partition,
+					Offset:     pom.offset,
+					Generation: om.generation,
+					Err:        ErrOffsetCommitRevoked,
+				}
+				Logger.Printf("consumer-group/offset-manager: dropping %v\n", cerr)
+				dropped = append(dropped, cerr)
+				pom.lock.Unlock()
+				continue
+			}
+			r.AddBlockWithLeaderEpoch(pom.topic, pom.partition, pom.offset, pom.leaderEpoch, commitTimestamp, pom.metadata)
+			versions[pom] = pom.version
 			pom.lock.Unlock()
 		}
 	}
 
 	if len(r.blocks) > 0 {
-		return r, versions
+		return r, versions, errors.Join(dropped...)
 	}
 
-	return nil, nil
+	return nil, nil, errors.Join(dropped...)
 }
 
-func (om *offsetManager) handleResponse(broker *Broker, req *OffsetCommitRequest, resp *OffsetCommitResponse, versions map[*partitionOffsetManager]uint64) {
+func (om *offsetManager) handleResponse(broker *Broker, req *OffsetCommitRequest, resp *OffsetCommitResponse, versions map[*partitionOffsetManager]uint64) error {
 	// release coordinator after dropping pomsLock to avoid lock inversion (#3191)
 	shouldRelease := false
+	var failures []error
 
 	om.pomsLock.RLock()
 	for _, topicManagers := range om.poms {
 		for _, pom := range topicManagers {
-			if req.blocks[pom.topic] == nil || req.blocks[pom.topic][pom.partition] == nil {
+			block := req.blocks[pom.topic][pom.partition]
+			if block == nil {
 				continue
 			}
 
@@ -421,22 +455,43 @@ func (om *offsetManager) handleResponse(broker *Broker, req *OffsetCommitRequest
 				continue
 			}
 
+			// commitFailed records the rejection with the partition and the
+			// generation it was attempted in, so the caller can tell a
+			// revocation from a network failure
+			commitFailed := func(err error) {
+				cerr := &OffsetCommitError{
+					Topic:      pom.topic,
+					Partition:  pom.partition,
+					Offset:     block.offset,
+					Generation: om.generation,
+					Err:        err,
+				}
+				pom.handleError(cerr)
+				failures = append(failures, cerr)
+			}
+
 			switch err {
 			case ErrNoError:
 				pom.updateCommitted(versions[pom])
 			case ErrNotLeaderForPartition, ErrLeaderNotAvailable,
 				ErrConsumerCoordinatorNotAvailable, ErrNotCoordinatorForConsumer:
 				// not a critical error, we just need to redispatch
+				commitFailed(err)
 				shouldRelease = true
+			case ErrIllegalGeneration, ErrUnknownMemberId, ErrFencedInstancedId:
+				// the coordinator refused the commit because this member's
+				// ownership is gone (a newer generation owns the partition
+				// now); redispatching the same commit cannot succeed
+				commitFailed(err)
+				if err == ErrFencedInstancedId {
+					// TODO close the whole consumer for instance fenced....
+					om.tryCancelSession()
+				}
 			case ErrOffsetMetadataTooLarge, ErrInvalidCommitOffsetSize:
 				// nothing we can do about this, just tell the user and carry on
-				pom.handleError(err)
+				commitFailed(err)
 			case ErrOffsetsLoadInProgress:
 				// nothing wrong but we didn't commit, we'll get it next time round
-			case ErrFencedInstancedId:
-				pom.handleError(err)
-				// TODO close the whole consumer for instance fenced....
-				om.tryCancelSession()
 			case ErrUnknownTopicOrPartition:
 				// let the user know *and* try redispatching - if topic-auto-create is
 				// enabled, redispatching should trigger a metadata req and create the
@@ -445,7 +500,7 @@ func (om *offsetManager) handleResponse(broker *Broker, req *OffsetCommitRequest
 				fallthrough
 			default:
 				// dunno, tell the user and try redispatching
-				pom.handleError(err)
+				commitFailed(err)
 				shouldRelease = true
 			}
 		}
@@ -455,20 +510,51 @@ func (om *offsetManager) handleResponse(broker *Broker, req *OffsetCommitRequest
 	if shouldRelease {
 		om.releaseCoordinator(broker)
 	}
+	return errors.Join(failures...)
 }
 
-func (om *offsetManager) handleErrorFor(err error, targets partitionTargets) {
+// commitFailure records err against every partition of req and returns the
+// joined *OffsetCommitError
+func (om *offsetManager) commitFailure(req *OffsetCommitRequest, err error) error {
+	targets := make(partitionTargets, len(req.blocks))
+	for topic, partitions := range req.blocks {
+		targets[topic] = make(map[int32]none, len(partitions))
+		for partition := range partitions {
+			targets[topic][partition] = none{}
+		}
+	}
+	return om.commitFailureFor(err, targets)
+}
+
+// commitFailureFor records err against every pom covered by targets and
+// returns the joined *OffsetCommitError
+func (om *offsetManager) commitFailureFor(err error, targets partitionTargets) error {
 	om.pomsLock.RLock()
 	defer om.pomsLock.RUnlock()
 
+	var errs []error
 	for topic, topicManagers := range om.poms {
 		for partition, pom := range topicManagers {
 			if !targets.covers(topic, partition) {
 				continue
 			}
-			pom.handleError(err)
+
+			pom.lock.Lock()
+			offset := pom.offset
+			pom.lock.Unlock()
+
+			cerr := &OffsetCommitError{
+				Topic:      topic,
+				Partition:  partition,
+				Offset:     offset,
+				Generation: om.generation,
+				Err:        err,
+			}
+			pom.handleError(cerr)
+			errs = append(errs, cerr)
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func (om *offsetManager) asyncClosePOMs() {
@@ -508,7 +594,7 @@ func (om *offsetManager) removePartitions(topicPartitions map[string][]int32) {
 	}
 
 	for attempt := 0; attempt <= om.conf.Consumer.Offsets.Retry.Max; attempt++ {
-		om.flushToBrokerFor(targets)
+		_ = om.flushToBrokerFor(targets)
 		if om.releaseSelectedPOMs(false, targets) == 0 {
 			return
 		}

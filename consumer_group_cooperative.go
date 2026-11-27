@@ -95,8 +95,16 @@ func (s *consumerGroupSession) reconcileAssignment(res *rebalanceResult) (bool, 
 		if err := s.revokeClaims(revoked); err != nil {
 			return false, err
 		}
+		// commit the revoked partitions one last time while they are still
+		// owned, so the member they are reassigned to resumes from the
+		// committed position
 		s.offsets.removePartitions(revoked)
 	}
+
+	// publish the new assignment before managing the added partitions: commits
+	// for the revoked ones are dropped from here on, and the added ones are
+	// owned by the time their offset managers exist
+	s.claims.Store(&res.claims)
 
 	for topic := range added {
 		if err := s.parent.client.RefreshMetadata(topic); err != nil {
@@ -107,7 +115,6 @@ func (s *consumerGroupSession) reconcileAssignment(res *rebalanceResult) (bool, 
 		return false, err
 	}
 
-	s.claims.Store(&res.claims)
 	s.startClaims(added)
 	s.watchPartitionNumbers(res)
 	return len(revoked) > 0, nil

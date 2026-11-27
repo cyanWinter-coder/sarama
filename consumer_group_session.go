@@ -3,6 +3,7 @@ package sarama
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,12 +35,20 @@ type ConsumerGroupSession interface {
 	// store immediately for efficiency reasons, and it may never be committed if
 	// your application crashes. This means that you may end up processing the same
 	// message twice, and your processing should ideally be idempotent.
+	//
+	// Marks for a partition this session no longer owns (revoked by a
+	// rebalance) are dropped and logged, so a stale mark cannot overwrite the
+	// offsets of the member the partition was reassigned to.
 	MarkOffset(topic string, partition int32, offset int64, metadata string)
 
 	// Commit the offset to the backend
 	//
-	// Note: calling Commit performs a blocking synchronous operation.
-	Commit()
+	// Note: calling Commit performs a blocking synchronous operation. Only
+	// partitions still owned by this session are committed. The returned error
+	// reports why a commit was rejected, wrapping an *OffsetCommitError per
+	// failed partition; use IsCommitRevocation to tell a revocation (do not
+	// retry) from a network or coordinator failure (a retry may succeed).
+	Commit() error
 
 	// ResetOffset resets to the provided offset, alongside a metadata string that
 	// represents the state of the partition consumer at that point in time. Reset
@@ -50,6 +59,13 @@ type ConsumerGroupSession interface {
 
 	// MarkMessage marks a message as consumed.
 	MarkMessage(msg *ConsumerMessage, metadata string)
+
+	// OwnsPartition reports whether the given partition is still claimed by
+	// this session. During a cooperative rebalance a partition can be revoked
+	// while its Messages channel is still draining; handlers should check
+	// ownership before processing a message or marking its offset, because
+	// offsets of partitions no longer owned are dropped instead of committed.
+	OwnsPartition(topic string, partition int32) bool
 
 	// Context returns the session context.
 	Context() context.Context
@@ -113,6 +129,10 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	sess.memberID.Store(&memberID)
 	sess.generationID.Store(generationID)
 	sess.claims.Store(&claims)
+
+	// commits follow partition ownership: the offset manager drops commits
+	// for partitions a cooperative rebalance has revoked from this session
+	offsets.ownership = sess.OwnsPartition
 
 	// start heartbeat loop
 	go sess.heartbeatLoop()
@@ -228,17 +248,33 @@ func (s *consumerGroupSession) Claims() map[string][]int32 { return *s.claims.Lo
 func (s *consumerGroupSession) MemberID() string           { return *s.memberID.Load() }
 func (s *consumerGroupSession) GenerationID() int32        { return s.generationID.Load() }
 
+func (s *consumerGroupSession) OwnsPartition(topic string, partition int32) bool {
+	return slices.Contains((*s.claims.Load())[topic], partition)
+}
+
 func (s *consumerGroupSession) MarkOffset(topic string, partition int32, offset int64, metadata string) {
+	if !s.OwnsPartition(topic, partition) {
+		Logger.Printf(
+			"consumergroup/session/%s/%d: dropping MarkOffset for revoked partition %s/%d at offset %d\n",
+			s.MemberID(), s.GenerationID(), topic, partition, offset)
+		return
+	}
 	if pom := s.offsets.findPOM(topic, partition); pom != nil {
 		pom.MarkOffset(offset, metadata)
 	}
 }
 
-func (s *consumerGroupSession) Commit() {
-	s.offsets.Commit()
+func (s *consumerGroupSession) Commit() error {
+	return s.offsets.Commit()
 }
 
 func (s *consumerGroupSession) ResetOffset(topic string, partition int32, offset int64, metadata string) {
+	if !s.OwnsPartition(topic, partition) {
+		Logger.Printf(
+			"consumergroup/session/%s/%d: dropping ResetOffset for revoked partition %s/%d at offset %d\n",
+			s.MemberID(), s.GenerationID(), topic, partition, offset)
+		return
+	}
 	if pom := s.offsets.findPOM(topic, partition); pom != nil {
 		pom.ResetOffset(offset, metadata)
 	}
